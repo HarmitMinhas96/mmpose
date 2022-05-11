@@ -40,13 +40,34 @@ def _convert_batchnorm(module):
     del module
     return module_output
 
+def add_image_norm(model):
+    assert model.cfg, "Expected model config to not be empty"
+    img_norm_cfg = None
+    for step in model.cfg.train_pipeline:
+        if step.type == 'NormalizeTensor':
+            img_norm_cfg = step
+    
+    if not img_norm_cfg:
+        return model
+    
+    def pre_forward(_, input):
+        mean = torch.tensor(img_norm_cfg['mean'])[None, ..., None,
+                                                        None]
+        std = torch.tensor(img_norm_cfg['std'])[None, ..., None,
+                                                None]
+        input_ret = [(i - mean) / std for i in input]
+        return type(input)(input_ret)
+
+    model.register_forward_pre_hook(pre_forward)
+    return model
 
 def pytorch2onnx(model,
                  input_shape,
                  opset_version=11,
                  show=False,
                  output_file='tmp.onnx',
-                 verify=False):
+                 verify=False,
+                 normalize_in_graph=False):
     """Convert pytorch model to onnx model.
 
     Args:
@@ -58,8 +79,12 @@ def pytorch2onnx(model,
         output_file (str): Output onnx model name. Default: 'tmp.onnx'.
         verify (bool): Determines whether to verify the onnx model.
             Default: False.
+        normalize_in_graph (bool): Whether image normalization should be added to the graph.
     """
     model.cpu().eval()
+
+    if normalize_in_graph:
+        add_image_norm(model)
 
     one_img = torch.randn(input_shape)
 
@@ -124,6 +149,10 @@ def parse_args():
         nargs='+',
         default=[1, 3, 256, 192],
         help='input size')
+    parser.add_argument(
+        '--normalize-in-graph',
+        action='store_true',
+        help='Whether to include image normalization in ONNX graph.')
     args = parser.parse_args()
     return args
 
@@ -154,12 +183,25 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError(
             'Please implement the forward method for exporting.')
+    
+    if args.shape is None:
+        img_scale = model.cfg.test_pipeline[1]['img_scale']
+        input_shape = (1, 3, img_scale[1], img_scale[0])
+    elif len(args.shape) == 1:
+        input_shape = (1, 3, args.shape[0], args.shape[0])
+    elif len(args.shape) == 2:
+        input_shape = (1, 3) + tuple(args.shape)
+    elif len(args.shape) == 4:
+        input_shape = tuple(args.shape)
+    else:
+        raise ValueError('invalid input shape')
 
     # convert model to onnx file
     pytorch2onnx(
         model,
-        args.shape,
+        input_shape,
         opset_version=args.opset_version,
         show=args.show,
         output_file=args.output_file,
-        verify=args.verify)
+        verify=args.verify,
+        normalize_in_graph=args.normalize_in_graph)
